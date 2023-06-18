@@ -1,69 +1,89 @@
-﻿using System.Net.Sockets;
+﻿using System.ComponentModel.Design;
+using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text.Json;
+using CoolandonRS.keyring.Yubikey;
 using netlib;
 
 namespace CoolandonRS.projlib.server;
 
 internal static class Negotiator {
     private const int TestLen = 64;
-    public static void Negotiate(TcpClient client) {
+    public static async Task Negotiate(TcpClient client, CancellationToken cancelToken) {
         try {
-            var rawPrep = Prepare(client);
+            var rawPrep = await Task.Run(()  => Prepare(client), cancelToken);
             if (rawPrep.term) return;
             var (communicator, projDetails, platform, bin, encryptedBin) = rawPrep.prep!.Value;
             while (true) {
-                var cmd = communicator.ReadStr();
+                cancelToken.ThrowIfCancellationRequested();
+                var cmd = communicator.ReadStr().Trim();
                 switch (cmd) {
                     case "disconnect":
                         return;
                     case "version":
-                        if (InDevMode(platform, communicator)) break;
+                        if (DevStatus(platform, communicator)) break;
                         AckWithData(communicator, projDetails.Ver);
                         break;
                     case "author":
-                        if (InDevMode(platform, communicator)) break;
+                        if (DevStatus(platform, communicator)) break;
                         AckWithData(communicator, projDetails.Author);
                         break;
                     case "desc":
-                        if (InDevMode(platform, communicator)) break;
+                        if (DevStatus(platform, communicator)) break;
                         AckWithData(communicator, projDetails.Desc);
                         break;
                     case "info":
-                        if (InDevMode(platform, communicator)) break;
+                        if (DevStatus(platform, communicator)) break;
                         AckWithData(communicator, JsonSerializer.Serialize(projDetails, new JsonSerializerOptions()));
                         break;
                     case "sha256sum":
-                        if (InDevMode(platform, communicator)) break;
+                        if (DevStatus(platform, communicator)) break;
                         AckWithData(communicator, NetUtil.GetSha256Sum(bin));
                         break;
                     case "len":
                         // NOTE: Provides length of ENCRYPTED binary, not the actual binary. That's what "truelen" is for.
-                        if (InDevMode(platform, communicator)) break;
+                        if (DevStatus(platform, communicator)) break;
                         AckWithData(communicator, encryptedBin.LongLength.ToString());
                         break;
                     case "truelen":
-                        if (InDevMode(platform, communicator)) break;
+                        if (DevStatus(platform, communicator)) break;
                         AckWithData(communicator, bin.LongLength.ToString());
                         break;
                     case "binary":
-                        if (InDevMode(platform, communicator)) break;
+                        if (DevStatus(platform, communicator)) break;
                         communicator.WriteStr("ACK");
                         communicator.Write(encryptedBin);
                         break;
                     case "promote":
+                        if (DevStatus(platform, communicator, true)) break;
                         communicator.WriteStr("ACK: Send authorization");
-                        var authToken = communicator.ReadStr();
-                        // TODO (implement in keyring, use here)
+                        var otp = communicator.ReadStr();
+                        try {
+                            var keys = await File.ReadAllLinesAsync($"{Program.AuthPath}/yubikeys.txt", cancelToken);
+                            var api = await File.ReadAllLinesAsync($"{Program.AuthPath}/yubiapi.txt", cancelToken);
+                            if (await YubiOTP.Verify(communicator.ReadStr(), (api[0], api[1]), keys)) {
+                                communicator.WriteStr("ACK: Promoted");
+                                if (await SuperNegotiator.Negotiate(communicator, cancelToken)) return;
+                            } else {
+                                communicator.WriteStr("NAK: Unauthorized");
+                            }
+                        } catch (YubicoErrorException e) {
+                            communicator.WriteStr($"NAK: {e.Message}");
+                        } catch (DiscrepancyException e) {
+                            communicator.WriteStr("NAK: Auth Discrepancy");
+                        }
+                        break;
+                    case "commands":
+                        communicator.WriteStr($"ACK: disconnect; {(DevStatus(platform) ? "promote; " : "version; author; desc; info; sha256sum; len; truelen; binary; ")} commands");
                         break;
                     default:
                         communicator.WriteStr("NAK: Unknown command");
                         break;
                 }
-                break;
             }
-        } catch {
-            // Suppress Errors
+        } catch (Exception e) {
+            // Suppress Errors, except when canceled
+            if (e is OperationCanceledException) throw;
         } finally {
             try {
                 client.Close();
@@ -113,7 +133,7 @@ internal static class Negotiator {
             encryptedBin = bin;
         } else {
             communicator.WriteStr("ACK: Platform registered. Now accepting commands.");
-            bin = File.ReadAllBytes(Program.BinaryPath + projName + "/" + platform);
+            bin = File.ReadAllBytes($"{Program.BinaryPath}/{projName}/{platform}");
             encryptedBin = communicator.GetRSAkeys().send.Encrypt(bin);
         }
 
@@ -121,11 +141,11 @@ internal static class Negotiator {
     }
 
     internal static (bool term, ProjectDetails? projDetails) GetProjDetails(string projName, TcpRsaCommunicator communicator) {
-        if (!File.Exists(Program.InfoPath + projName + ".json")) {
+        if (!File.Exists($"{Program.InfoPath}/{projName}.json")) {
             communicator.WriteStr("NAK: Unknown project");
             return (true, null);
         }
-        var projDetails = JsonSerializer.Deserialize<ProjectDetails>(File.ReadAllText(Program.InfoPath + projName + ".json"));
+        var projDetails = JsonSerializer.Deserialize<ProjectDetails>(File.ReadAllText($"{Program.InfoPath}/{projName}.json"));
         if (projDetails != null) return (false, projDetails);
         communicator.WriteStr("NAK: Unknown project");
         return (true, null);
@@ -137,11 +157,12 @@ internal static class Negotiator {
     /// </summary>
     /// <param name="platform">Platform. If "dev", program is in dev mode.</param>
     /// <param name="communicator">Optional. If provided, will write a NAK</param>
-    /// <returns>If in dev mode</returns>
-    private static bool InDevMode(string platform, TcpCommunicator? communicator = null) {
-        if (platform != "dev") return false;
-        communicator?.WriteStr("NAK: Unsupported in dev mode");
-        return true;
+    /// <param name="desired">Desired State</param>
+    /// <returns>desired if in project mode, !desired if in dev mode</returns>
+    private static bool DevStatus(string platform, TcpCommunicator? communicator = null, bool desired = false) {
+        if (platform != "dev") return desired;
+        communicator?.WriteStr($"NAK: Unsupported in {(desired ? "project" : "dev")} mode");
+        return !desired;
     }
 
     private static string? Login(TcpClient client) {
@@ -149,7 +170,7 @@ internal static class Negotiator {
         // (Plus, its not like closing the communicators actually does much besides closing the client)
         var tempCommunicator = new TcpRsaCommunicator(client, Program.PemData, "");
         var name = tempCommunicator.ReadStr();
-        var testPemData = File.ReadAllText(Program.UserKeyPath + name + ".pub.pem");
+        var testPemData = File.ReadAllText($"${Program.UserKeyPath}/{name}.pub.pem");
         var testCommunicator = new TcpRsaCommunicator(client, Program.PemData, testPemData);
         var confirmData = Convert.ToBase64String(RandomNumberGenerator.GetBytes(TestLen));
         testCommunicator.WriteStr(confirmData);
