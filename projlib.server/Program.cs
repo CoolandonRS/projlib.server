@@ -1,6 +1,6 @@
 ﻿using System.Net;
 using System.Net.Sockets;
-using netlib;
+using CoolandonRS.projlib.server.generics;
 
 namespace CoolandonRS.projlib.server;
 

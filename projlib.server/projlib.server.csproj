@@ -9,7 +9,7 @@
 
     <ItemGroup>
       <PackageReference Include="CoolandonRS.keyring" Version="1.1.0" />
-      <PackageReference Include="coolandonrs.netlib" Version="1.0.0-beta" />
+      <PackageReference Include="coolandonrs.netlib" Version="1.1.0-beta" />
     </ItemGroup>
 
 </Project>

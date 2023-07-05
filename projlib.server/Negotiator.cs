@@ -3,7 +3,9 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text.Json;
 using CoolandonRS.keyring.Yubikey;
-using netlib;
+using CoolandonRS.netlib;
+using CoolandonRS.projlib.server.Extensions;
+using CoolandonRS.projlib.server.generics;
 
 namespace CoolandonRS.projlib.server;
 
@@ -22,62 +24,62 @@ internal static class Negotiator {
                         return;
                     case "version":
                         if (DevStatus(platform, communicator)) break;
-                        AckWithData(communicator, projDetails.Ver);
+                        communicator.Ack(projDetails.Ver);
                         break;
                     case "author":
                         if (DevStatus(platform, communicator)) break;
-                        AckWithData(communicator, projDetails.Author);
+                        communicator.Ack(projDetails.Author);
                         break;
                     case "desc":
                         if (DevStatus(platform, communicator)) break;
-                        AckWithData(communicator, projDetails.Desc);
+                        communicator.Ack(projDetails.Desc);
                         break;
                     case "info":
                         if (DevStatus(platform, communicator)) break;
-                        AckWithData(communicator, JsonSerializer.Serialize(projDetails, new JsonSerializerOptions()));
+                        communicator.Ack(JsonSerializer.Serialize(projDetails, new JsonSerializerOptions()));
                         break;
                     case "sha256sum":
                         if (DevStatus(platform, communicator)) break;
-                        AckWithData(communicator, NetUtil.GetSha256Sum(bin));
+                        communicator.Ack(NetUtil.GetSha256Sum(bin));
                         break;
                     case "len":
                         // NOTE: Provides length of ENCRYPTED binary, not the actual binary. That's what "truelen" is for.
                         if (DevStatus(platform, communicator)) break;
-                        AckWithData(communicator, encryptedBin.LongLength.ToString());
+                        communicator.Ack(encryptedBin.LongLength.ToString());
                         break;
                     case "truelen":
                         if (DevStatus(platform, communicator)) break;
-                        AckWithData(communicator, bin.LongLength.ToString());
+                        communicator.Ack(bin.LongLength.ToString());
                         break;
                     case "binary":
                         if (DevStatus(platform, communicator)) break;
-                        communicator.WriteStr("ACK");
+                        communicator.Ack();
                         communicator.Write(encryptedBin);
                         break;
                     case "promote":
                         if (DevStatus(platform, communicator, true)) break;
-                        communicator.WriteStr("ACK: Send authorization");
+                        communicator.Ack("Send authorization");
                         var otp = communicator.ReadStr();
                         try {
                             var keys = await File.ReadAllLinesAsync($"{Program.AuthPath}/yubikeys.txt", cancelToken);
                             var api = await File.ReadAllLinesAsync($"{Program.AuthPath}/yubiapi.txt", cancelToken);
                             if (await YubiOTP.Verify(communicator.ReadStr(), (api[0], api[1]), keys)) {
-                                communicator.WriteStr("ACK: Promoted");
+                                communicator.Ack("Promoted");
                                 if (await SuperNegotiator.Negotiate(communicator, cancelToken)) return;
                             } else {
-                                communicator.WriteStr("NAK: Unauthorized");
+                                communicator.Nak("Unauthorized");
                             }
                         } catch (YubicoErrorException e) {
-                            communicator.WriteStr($"NAK: {e.Message}");
+                            communicator.Nak($"{e.Message}");
                         } catch (DiscrepancyException e) {
-                            communicator.WriteStr("NAK: Auth Discrepancy");
+                            communicator.Nak("Auth Discrepancy");
                         }
                         break;
                     case "commands":
-                        communicator.WriteStr($"ACK: disconnect; {(DevStatus(platform) ? "promote; " : "version; author; desc; info; sha256sum; len; truelen; binary; ")} commands");
+                        communicator.Ack($"disconnect; {(DevStatus(platform) ? "promote; " : "version; author; desc; info; sha256sum; len; truelen; binary; ")} commands");
                         break;
                     default:
-                        communicator.WriteStr("NAK: Unknown command");
+                        communicator.Nak("Unknown command");
                         break;
                 }
             }
@@ -98,14 +100,14 @@ internal static class Negotiator {
         if (outPemData == null) return (true, null);
         var communicator = new TcpRsaCommunicator(client, Program.PemData, outPemData);
         if (!VerifyVer(communicator)) {
-            communicator.WriteStr("NAK: Incompatible version or invalid string.\nTerminating Connection.");
+            communicator.Nak("Incompatible version or invalid string", "Terminating Connection");
             return (true, null);
         }
-        communicator.WriteStr("ACK: Version verified. Post projName");
+        communicator.Ack("Version verified", "Post projName");
 
         var projName = communicator.ReadStr();
         if (projName == "listAll") {
-            communicator.WriteStr("ACK: Now sending all project names and disconnecting");
+            communicator.Ack("Now sending all project names and disconnecting");
             communicator.WriteStr(string.Join('\n', Directory.GetFiles(Program.InfoPath).Select(Path.GetFileNameWithoutExtension).ToArray()));
             return (true, null);
         }
@@ -116,23 +118,23 @@ internal static class Negotiator {
             if (rawProj.term) return (true, null);
             projDetails = rawProj.projDetails!;
         } else {
-            projDetails = new ProjectDetails();
+            projDetails = new ProjectDetails("", "", "", new []{"dev"});
         }
 
-        communicator.WriteStr("ACK: Project Loaded. Send platform.");
+        communicator.Ack("Project Loaded", "Send platform.");
         var platform = communicator.ReadStr();
         byte[] bin;
         byte[] encryptedBin;
-        if (!(projDetails.SupportedPlatforms.Contains(platform)) && platform != "dev") {
-            communicator.WriteStr("NAK: Unknown or unsupported platform");
+        if (projDetails.SupportedPlatforms.Contains(platform)) {
+            communicator.Nak("Unknown or unsupported platform");
             return (true, null);
         }
         if (platform == "dev") {
-            communicator.WriteStr("ACK: Dev mode enabled. sha256sum, len, truelen, and binary aren't supported");
+            communicator.Ack("Dev mode enabled", "sha256sum, len, truelen, and binary aren't supported");
             bin = Array.Empty<byte>();
             encryptedBin = bin;
         } else {
-            communicator.WriteStr("ACK: Platform registered. Now accepting commands.");
+            communicator.Ack("Platform registered", "Now accepting commands");
             bin = File.ReadAllBytes($"{Program.BinaryPath}/{projName}/{platform}");
             encryptedBin = communicator.GetRSAkeys().send.Encrypt(bin);
         }
@@ -142,14 +144,13 @@ internal static class Negotiator {
 
     internal static (bool term, ProjectDetails? projDetails) GetProjDetails(string projName, TcpRsaCommunicator communicator) {
         if (!File.Exists($"{Program.InfoPath}/{projName}.json")) {
-            communicator.WriteStr("NAK: Unknown project");
+            communicator.Nak("Unknown Project");
             return (true, null);
         }
         var projDetails = JsonSerializer.Deserialize<ProjectDetails>(File.ReadAllText($"{Program.InfoPath}/{projName}.json"));
         if (projDetails != null) return (false, projDetails);
-        communicator.WriteStr("NAK: Unknown project");
+        communicator.Nak("Unknown Project");
         return (true, null);
-
     }
 
     /// <summary>
@@ -161,7 +162,7 @@ internal static class Negotiator {
     /// <returns>desired if in project mode, !desired if in dev mode</returns>
     private static bool DevStatus(string platform, TcpCommunicator? communicator = null, bool desired = false) {
         if (platform != "dev") return desired;
-        communicator?.WriteStr($"NAK: Unsupported in {(desired ? "project" : "dev")} mode");
+        communicator?.Nak($"Unsupported in {(desired ? "project" : "dev")} mode");
         return !desired;
     }
 
@@ -175,7 +176,7 @@ internal static class Negotiator {
         var confirmData = Convert.ToBase64String(RandomNumberGenerator.GetBytes(TestLen));
         testCommunicator.WriteStr(confirmData);
         if (testCommunicator.ReadStr() != confirmData) return null;
-        testCommunicator.WriteStr("ACK: Verified. Post updater version.");
+        testCommunicator.Ack("Verified", "Post updater version");
         testCommunicator.Close();
         return testPemData;
     }
@@ -187,14 +188,5 @@ internal static class Negotiator {
         } catch {
             return false;
         }
-    }
-
-    /// <summary>
-    /// Sends "ACK: [data]"
-    /// </summary>
-    /// <param name="communicator">Communicator to send to</param>
-    /// <param name="data">Value of [data]</param>
-    internal static void AckWithData(TcpCommunicator communicator, string data) {
-        communicator.WriteStr("ACK: " + data);
     }
 }
