@@ -2,8 +2,10 @@
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text.Json;
+using CoolandonRS.keyring;
 using CoolandonRS.keyring.Yubikey;
 using CoolandonRS.netlib;
+using CoolandonRS.netlib.Encrypted;
 using CoolandonRS.projlib.server.Extensions;
 using CoolandonRS.projlib.server.generics;
 
@@ -15,7 +17,7 @@ internal static class Negotiator {
         try {
             var rawPrep = await Task.Run(()  => Prepare(client), cancelToken);
             if (rawPrep.term) return;
-            var (communicator, projDetails, platform, bin, encryptedBin) = rawPrep.prep!.Value;
+            var (communicator, projDetails, platform, bin) = rawPrep.prep!.Value;
             while (true) {
                 cancelToken.ThrowIfCancellationRequested();
                 var cmd = communicator.ReadStr().Trim();
@@ -43,18 +45,13 @@ internal static class Negotiator {
                         communicator.Ack(NetUtil.GetSha256Sum(bin));
                         break;
                     case "len":
-                        // NOTE: Provides length of ENCRYPTED binary, not the actual binary. That's what "truelen" is for.
-                        if (DevStatus(platform, communicator)) break;
-                        communicator.Ack(encryptedBin.LongLength.ToString());
-                        break;
-                    case "truelen":
                         if (DevStatus(platform, communicator)) break;
                         communicator.Ack(bin.LongLength.ToString());
                         break;
                     case "binary":
                         if (DevStatus(platform, communicator)) break;
                         communicator.Ack();
-                        communicator.Write(encryptedBin);
+                        communicator.Write(bin);
                         break;
                     case "promote":
                         if (DevStatus(platform, communicator, true)) break;
@@ -95,10 +92,15 @@ internal static class Negotiator {
         }
     }
 
-    private static (bool term, (TcpRsaCommunicator communicator, ProjectDetails projectDetails, string platform, byte[] bin, byte[] encryptedBin)? prep) Prepare(TcpClient client) {
-        var outPemData = Login(client);
-        if (outPemData == null) return (true, null);
-        var communicator = new TcpRsaCommunicator(client, Program.PemData, outPemData);
+    private static (bool term, (AESTcpCommunicator communicator, ProjectDetails projectDetails, string platform, byte[] bin)? prep) Prepare(TcpClient client) {
+        var communicator = EncryptedUtil.AuthToAESServer(client, new RSAUtil(KeyType.Private, Program.PemData), str => {
+            try {
+                return new RSAUtil(KeyType.Public, File.ReadAllText($"{Program.UserKeyPath}/{str}.pub.pem"));
+            } catch {
+                return null;
+            }
+        });
+        if (communicator == null) return (true, null);
         if (!VerifyVer(communicator)) {
             communicator.Nak("Incompatible version or invalid string", "Terminating Connection");
             return (true, null);
@@ -132,24 +134,22 @@ internal static class Negotiator {
         if (platform == "dev") {
             communicator.Ack("Dev mode enabled", "sha256sum, len, truelen, and binary aren't supported");
             bin = Array.Empty<byte>();
-            encryptedBin = bin;
         } else {
             communicator.Ack("Platform registered", "Now accepting commands");
             bin = File.ReadAllBytes($"{Program.BinaryPath}/{projName}/{platform}");
-            encryptedBin = communicator.GetRSAkeys().send.Encrypt(bin);
         }
 
-        return (false, (communicator, projDetails, platform, bin, encryptedBin));
+        return (false, (communicator, projDetails, platform, bin));
     }
 
-    internal static (bool term, ProjectDetails? projDetails) GetProjDetails(string projName, TcpRsaCommunicator communicator) {
+    internal static (bool term, ProjectDetails? projDetails) GetProjDetails(string projName, AESTcpCommunicator communicator, bool write = true) {
         if (!File.Exists($"{Program.InfoPath}/{projName}.json")) {
-            communicator.Nak("Unknown Project");
+            if (write) communicator.Nak("Unknown Project");
             return (true, null);
         }
         var projDetails = JsonSerializer.Deserialize<ProjectDetails>(File.ReadAllText($"{Program.InfoPath}/{projName}.json"));
         if (projDetails != null) return (false, projDetails);
-        communicator.Nak("Unknown Project");
+        if (write) communicator.Nak("Unknown Project");
         return (true, null);
     }
 
@@ -164,21 +164,6 @@ internal static class Negotiator {
         if (platform != "dev") return desired;
         communicator?.Nak($"Unsupported in {(desired ? "project" : "dev")} mode");
         return !desired;
-    }
-
-    private static string? Login(TcpClient client) {
-        // Do not close Communicators used in Login, as that would close the client, which we wish to reuse.
-        // (Plus, its not like closing the communicators actually does much besides closing the client)
-        var tempCommunicator = new TcpRsaCommunicator(client, Program.PemData, "");
-        var name = tempCommunicator.ReadStr();
-        var testPemData = File.ReadAllText($"${Program.UserKeyPath}/{name}.pub.pem");
-        var testCommunicator = new TcpRsaCommunicator(client, Program.PemData, testPemData);
-        var confirmData = Convert.ToBase64String(RandomNumberGenerator.GetBytes(TestLen));
-        testCommunicator.WriteStr(confirmData);
-        if (testCommunicator.ReadStr() != confirmData) return null;
-        testCommunicator.Ack("Verified", "Post updater version");
-        testCommunicator.Close();
-        return testPemData;
     }
 
     private static bool VerifyVer(TcpCommunicator communicator) {

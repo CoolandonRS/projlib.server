@@ -1,6 +1,10 @@
-﻿using System.Data;
+﻿using System.ComponentModel.Design;
+using System.Data;
+using System.Net.Http.Json;
+using System.Runtime.InteropServices.ComTypes;
 using System.Text.Json;
 using CoolandonRS.netlib;
+using CoolandonRS.netlib.Encrypted;
 using CoolandonRS.projlib.server.Extensions;
 using CoolandonRS.projlib.server.generics;
 
@@ -11,7 +15,7 @@ namespace CoolandonRS.projlib.server;
 /// </summary>
 public static class SuperNegotiator {
     // TODO more commands
-    public static async Task<bool> Negotiate(TcpRsaCommunicator communicator, CancellationToken cancelToken) {
+    public static async Task<bool> Negotiate(AESTcpCommunicator communicator, CancellationToken cancelToken) {
         while (true) {
             cancelToken.ThrowIfCancellationRequested();
             var cmd = communicator.ReadStr().Split(' ').Select(s => s.Trim()).ToArray();
@@ -21,13 +25,30 @@ public static class SuperNegotiator {
                 case "demote":
                     communicator.Ack("demoted");
                     return false;
+                case "makeuser":
+                    communicator.Ack($"Creating {cmd[1]}", "Send rsa.pub.pem");
+                    await File.WriteAllBytesAsync($"{Program.UserKeyPath}/{cmd[1]}.pub.pem", communicator.Read(), cancelToken);
+                    communicator.Ack($"Created {cmd[1]}");
+                    break;
+                case "deluser":
+                    try {
+                        File.Delete($"{Program.UserKeyPath}/{cmd[1]}");
+                        communicator.Ack($"Deleted {cmd[1]}");
+                    } catch {
+                        communicator.Nak($"Unable to delete {cmd[1]}");
+                    }
+                    break;
                 case "makeadmin":
                     await File.AppendAllLinesAsync($"{Program.AuthPath}/yubikeys.txt", cmd[1..], cancelToken);
+                    break;
+                case "deladmin":
+                    var contents = (await File.ReadAllLinesAsync($"{Program.AuthPath}/yubikeys.txt", cancelToken));
+                    await File.WriteAllLinesAsync($"{Program.AuthPath}/yubikeys.txt", contents.Except(cmd[1..]), cancelToken);
                     break;
                 case "upload":
                     var projName = cmd[1];
                     var ver = cmd[2];
-                    var (unknownProj, projDetails) = Negotiator.GetProjDetails(projName, communicator);
+                    var (unknownProj, projDetails) = Negotiator.GetProjDetails(projName, communicator, false);
                     switch (unknownProj) {
                         case false when new SemVer(projDetails!.Ver).IsBetaComparedTo(new SemVer(ver)):
                             communicator.Nak("Attempting to upload outdated version");
@@ -50,8 +71,9 @@ public static class SuperNegotiator {
                             Directory.CreateDirectory($"{Program.BinaryPath}/{projName}");
                             break;
                         default:
-                            projDetails = new ProjectDetails(projDetails, true);
-                            projDetails.Ver = ver;
+                            projDetails = new ProjectDetails(projDetails, true) {
+                                Ver = ver
+                            };
                             foreach (var file in Directory.GetFiles($"{Program.BinaryPath}/{projName}")) File.Delete(file);
                             break;
                     }
@@ -69,7 +91,7 @@ public static class SuperNegotiator {
                             communicator.Nak("Duplicate platform");
                             continue;
                         }
-                        var bin = communicator.ReadN(len);
+                        var bin = communicator.Read();
                         platforms.Add(platform);
                         await File.WriteAllBytesAsync($"{Program.BinaryPath}/{projName}/{platform}", bin, cancelToken);
                         communicator.Ack($"Uploaded {platform}");
@@ -78,8 +100,14 @@ public static class SuperNegotiator {
                     await File.WriteAllTextAsync($"{Program.InfoPath}/{projName}.json", JsonSerializer.Serialize(projDetails), cancelToken);
                     communicator.Ack("Upload complete");
                     break;
+                case "del":
+                    var (found, _) = Negotiator.GetProjDetails(cmd[1], communicator);
+                    if (!found) continue;
+                    Directory.Delete($"{Program.BinaryPath}/{cmd[1]}", true);
+                    communicator.Ack($"Deleted {cmd[1]}");
+                    break;
                 case "commands":
-                    communicator.Ack("disconnect; demote; makeadmin; upload; commands");
+                    communicator.Ack("disconnect; demote; makeuser; deluser; makeadmin; deladmin; upload; del; commands");
                     break;
                 default:
                     communicator.Nak("Unknown sudo command");
